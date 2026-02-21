@@ -1,0 +1,437 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+import pdfplumber
+
+def cabang_from_filename(pdf_path) -> str:
+    stem = getattr(pdf_path, "stem", str(pdf_path))
+    stem = str(stem).upper()
+    m = re.search(r"SME_([A-Z]{3})", stem)
+    if m:
+        return m.group(1)  # contoh: SMG, MGL, PKG, GTG, SLA, PWD
+    return ""
+
+
+def clean_nama(nama: str) -> str:
+    s = (nama or "").strip()
+    # buang prefix MILIK / MILIKI / MILIK:
+    s = re.sub(r'^(MILIK(I)?)(\s*:\s*|\s+)+', '', s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalize_fasilitas(f: str) -> str:
+    s = (f or "").upper()
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if "LETTER OF CREDIT" in s or "L/C" in s or re.search(r"\bLC\b", s):
+        return "L/C"
+    if "TRUST RECEIPT" in s:
+        return "TRUST RECEIPT"
+    if "KREDIT MULTI" in s:
+        return "KREDIT MULTI FASILITAS"
+    if "TIME LOAN" in s:
+        return "TIME LOAN"
+    if "KREDIT LOKAL" in s:
+        return "KREDIT LOKAL"
+    if "BANK GARANSI" in s:
+        return "BANK GARANSI"
+    return s
+
+
+DATE_RE = re.compile(r"\b(\d{2}-\d{2}-\d{4})\b")
+ACC_RE  = re.compile(r"\b(\d{10})\b")
+CIF_RE  = re.compile(r"\((\d{11})\)")
+
+ROWSTART_RE = re.compile(r"^(?:(\d{5})\s+-\s+.+?\s+)?(\d+)\s+")
+
+SECTOR_KEYWORDS = {
+    "PETERNAKAN","MAKANAN","DISTRIBUSI","PROPERTI","TELEKOMUNIKASI","OTOMOTIF",
+    "TRANSPORTASI","BAHAN","PERKEBUNAN","MEDIA","JASA","PERTAMBANGAN","FARMASI",
+    "TEKSTIL","PRASARANA","HASIL","INDUSTRI","KEBUTUHAN","PERALATAN","PACKAGING",
+    "KONSTRUKSI","MIGAS","LISTRIK","LOGAM","KIMIA","PLASTIK","KAYU","KEHUTANAN"
+}
+
+NON_NAME_NOISE = {"MOBIL","MOTOR","IDR","USD","LOAN"}
+CORP_MARKERS = {"PT","CV","UD","PD","TB","KOPERASI"}
+
+
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _is_noise(line: str) -> bool:
+    if not line:
+        return True
+    prefixes = (
+        "LAPORAN JATUH TEMPO", "CABANG", "Data Per",
+        "KODE AO", "NO NAMA", "MIS;", "Hal :"
+    )
+    return line.startswith(prefixes)
+
+
+def _parse_amount(tok: str | None) -> int | None:
+    if tok is None:
+        return None
+    t = tok.replace(",", "").strip()
+    if not t:
+        return None
+    try:
+        return int(t)
+    except Exception:
+        return None
+
+
+def _tokenize(s: str) -> list[str]:
+    return [t for t in re.split(r"\s+", s.strip()) if t]
+
+
+def _is_date_token(t: str) -> bool:
+    return bool(re.fullmatch(r"\d{2}-\d{2}-\d{4}", t))
+
+
+def _normalize_token(t: str) -> str:
+    return re.sub(r"[^\w/&\-.']", "", t)
+
+
+def _clean_company_name(tokens: list[str]) -> list[str]:
+    """Jika ada PT/CV, potong sampai PT/CV (inklusif)."""
+    upp = [_normalize_token(x).upper() for x in tokens]
+    for i, u in enumerate(upp):
+        if u in {"PT", "CV"}:
+            return tokens[: i + 1]
+    return tokens
+
+
+def _looks_like_bad_name(name: str) -> bool:
+    if not name:
+        return True
+    u = name.upper()
+    if "IDR" in u or "USD" in u:
+        return True
+    if DATE_RE.search(name) or ACC_RE.search(name):
+        return True
+    return False
+
+
+def _dedup(tokens: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _derive_name_from_borrower_line(line: str) -> str:
+    """
+    Robust name parsing for SME report line:
+    - If CIF appears before ACC => take before CIF.
+    - If CIF appears after ACC / scrambled => take tokens until ACC/sector,
+      and (optional) append last alphabetic word before CIF for personal name.
+    """
+    s = _clean(line)
+    m = ROWSTART_RE.match(s)
+    if not m:
+        return ""
+
+    after = s[m.end():].strip()
+
+    cif_m = CIF_RE.search(after)
+    acc_m = ACC_RE.search(after)
+    cif_pos = cif_m.start() if cif_m else None
+    acc_pos = acc_m.start() if acc_m else None
+
+    # Normal: CIF before ACC
+    if cif_pos is not None and (acc_pos is None or cif_pos < acc_pos):
+        name_seg = after[:cif_pos].strip()
+        toks = [_normalize_token(t) for t in _tokenize(name_seg)]
+        toks = [t for t in toks if t and not _is_date_token(t)]
+        toks = _clean_company_name(toks)
+        return " ".join(toks).strip(" -.,;/")
+
+    toks = _tokenize(after)
+
+    # Cut before ACC token if present
+    acc_tok = acc_m.group(1) if acc_m else None
+    acc_idx = toks.index(acc_tok) if acc_tok in toks else None
+
+    cut = len(toks)
+    if acc_idx is not None:
+        cut = min(cut, acc_idx)
+
+    for i, t in enumerate(toks):
+        u = _normalize_token(t).upper()
+        if u in SECTOR_KEYWORDS:
+            cut = min(cut, i)
+            break
+
+    initial = toks[:cut]
+    initial = [t for t in initial if not _is_date_token(t)]
+    initial_up = {_normalize_token(t).upper() for t in initial}
+    is_corp = bool(initial_up & CORP_MARKERS)
+
+    if is_corp:
+        initial = _clean_company_name(initial)
+    else:
+        initial = initial[:3]  # personal name cap
+
+    # tail: last alphabetic word before CIF token (optional)
+    tail: list[str] = []
+    if cif_m:
+        cif_tok_idx = None
+        for i, t in enumerate(toks):
+            if "(" in t:
+                cif_tok_idx = i
+                break
+        if cif_tok_idx is not None:
+            cand = toks[max(0, cif_tok_idx - 4):cif_tok_idx]
+            alpha = []
+            for t in cand:
+                tt = _normalize_token(t).upper()
+                if not tt or tt in SECTOR_KEYWORDS or tt in NON_NAME_NOISE or _is_date_token(t):
+                    continue
+                if re.fullmatch(r"[\d,]+", t):
+                    continue
+                if t.isalpha() and len(t) >= 3:
+                    alpha.append(t)
+            if alpha and not is_corp:
+                tail = alpha[-1:]
+
+    tokens = [_normalize_token(t) for t in (initial + tail)]
+    tokens = [t for t in tokens if t and not _is_date_token(t)]
+    tokens = _dedup(tokens)
+    return " ".join(tokens).strip(" -.,;/")
+
+def _merge_wrapped(lines: list[str]) -> list[str]:
+    """Merge borrower lines and facility lines split across rows."""
+    out: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        nxt2 = lines[i + 2] if i + 2 < len(lines) else ""
+
+        # kosong / noise → lewatkan
+        if not line:
+            i += 1
+            continue
+
+        # ===== Patch: jangan merge baris L/C (sering CNY & tidak pakai IDR/USD) =====
+        u = line.upper()
+        is_lc = ("L/C" in u) or ("LETTER OF CREDIT" in u)
+        # ========================================================================
+
+        # Facility split: ACC present tapi kemungkinan baris pecah
+        if ACC_RE.search(line) and (not is_lc):
+            # jika tidak ada currency (IDR/USD/CNY) atau tanggal kurang dari 2 → coba merge
+            missing_currency = (" IDR " not in f" {line} " and " USD " not in f" {line} " and " CNY " not in f" {line} ")
+            missing_dates = len(DATE_RE.findall(line)) < 2
+
+            if missing_currency or missing_dates:
+                comb = _clean(line + " " + nxt)
+
+                missing_currency2 = (" IDR " not in f" {comb} " and " USD " not in f" {comb} " and " CNY " not in f" {comb} ")
+                missing_dates2 = len(DATE_RE.findall(comb)) < 2
+
+                if nxt2 and (missing_currency2 or missing_dates2):
+                    out.append(_clean(comb + " " + nxt2))
+                    i += 3
+                    continue
+
+                out.append(comb)
+                i += 2
+                continue
+
+        # default: tidak merge
+        out.append(_clean(line))
+        i += 1
+
+# Facility split: ACC present but missing currency/dates
+# IMPORTANT: jangan merge baris L/C (sering pakai CNY tanpa IDR/USD),
+# karena baris berikutnya bisa sudah mulai debitur baru.
+if ACC_RE.search(line):
+    u = line.upper()
+    is_lc = ("L/C" in u) or ("LETTER OF CREDIT" in u)
+
+    if (not is_lc) and ((" IDR " not in f" {line} " and " USD " not in f" {line} " and " CNY " not in f" {line} ") or len(DATE_RE.findall(line)) < 2):
+        comb = _clean(line + " " + nxt)
+        if nxt2 and ((" IDR " not in f" {comb} " and " USD " not in f" {comb} " and " CNY " not in f" {comb} ") or len(DATE_RE.findall(comb)) < 2):
+            out.append(_clean(comb + " " + nxt2))
+            i += 3
+            continue
+        out.append(comb)
+        i += 2
+        continue
+
+        out.append(line)
+        i += 1
+
+    return [l for l in out if l]
+
+
+def _infer_cabang_from_filename(path: Path) -> str:
+    u = path.name.upper()
+    if "SME_CLC" in u or "CLC" in u:
+        return "CLC"
+    if "SME_KDS" in u or "KDS" in u:
+        return "KDS"
+    if "SME_TGL" in u or "TGL" in u:
+        return "TGL"
+    return ""
+
+def parse_pdfs_to_raw(pdf_paths: Iterable[Path]) -> pd.DataFrame:
+    rows: list[dict] = []
+
+    current_name = ""
+    current_cif = ""
+    last_acc: str | None = None
+
+    for pdf_path in pdf_paths:
+        cabang_code = cabang_from_filename(pdf_path)
+
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                raw_lines = [_clean(x) for x in text.split("\n")]
+                raw_lines = [l for l in raw_lines if not _is_noise(l)]
+                lines = _merge_wrapped(raw_lines)
+
+                for line in lines:
+                    if _is_noise(line):
+                        continue
+                    # ===== PATCH KHUSUS L/C (MELEKAT KE DEBITUR SEBELUMNYA) =====
+                    if (
+                        ("L/C" in line.upper() or "LETTER OF CREDIT" in line.upper())
+                        and current_name
+                        and last_acc
+                    ):
+                        dates = DATE_RE.findall(line)
+                        nums = re.findall(r"\b\d{1,3}(?:,\d{3})+\b|\b\d+\b", line)
+
+                        plafond = None
+                        if nums:
+                            try:
+                                plafond = max(int(n.replace(",", "")) for n in nums)
+                            except Exception:
+                                plafond = None
+
+                        try:
+                            dt_akhir = datetime.strptime(dates[-1], "%d-%m-%Y").date() if dates else None
+                        except Exception:
+                            dt_akhir = None
+
+                        nama_full = f"{current_name} ({current_cif})" if current_cif else current_name
+
+                        rows.append({
+                            "Nama": nama_full,
+                            "ACC No": last_acc,
+                            "Cabang": cabang_code,
+                            "Fasilitas": "L/C",
+                            "Plafond": plafond,
+                            "Tgl PMK/PK Akhir": dt_akhir,
+                            "SumberFile": pdf_path.name,
+                        })
+                        continue
+                    # ===== END PATCH L/C =====
+
+                    # borrower line: rowstart + CIF
+                    if ROWSTART_RE.match(line) and CIF_RE.search(line):
+                        cif_m = CIF_RE.search(line)
+                        cif_val = cif_m.group(1) if cif_m else ""
+                        nm = _derive_name_from_borrower_line(line)
+                        if nm and not _looks_like_bad_name(nm):
+                            current_name = nm
+                            current_cif = cif_val
+                            last_acc = None
+
+                    # facility line
+                    accs = ACC_RE.findall(line)
+                    dates = DATE_RE.findall(line)
+
+                    if accs and len(dates) >= 2 and current_name:
+                        acc = accs[0]
+                        toks = line.split()
+                        try:
+                            i_acc = toks.index(acc)
+                        except ValueError:
+                            continue
+
+                        currency_idx = None
+                        for j in range(i_acc + 1, len(toks)):
+                            if toks[j] in ("IDR","CNY","USD"):
+                                currency_idx = j
+                                break
+                        if currency_idx is None:
+                            continue
+
+                        fasilitas = " ".join(toks[i_acc + 1:currency_idx]).strip().upper()
+                        plafond = _parse_amount(toks[currency_idx + 1]) if currency_idx + 1 < len(toks) else None
+
+                        try:
+                            dt_akhir = datetime.strptime(dates[-1], "%d-%m-%Y").date()
+                        except Exception:
+                            dt_akhir = None
+
+                        nama_full = f"{current_name} ({current_cif})" if current_cif else current_name
+
+                        rows.append({
+                            "Nama": nama_full,
+                            "ACC No": acc,
+                            "Cabang": cabang_code,
+                            "Fasilitas": fasilitas,
+                            "Plafond": plafond,
+                            "Tgl PMK/PK Akhir": dt_akhir,
+                            "SumberFile": pdf_path.name,
+                        })
+
+                        last_acc = acc
+                        continue
+
+                    # continuation line without ACC but with currency + dates
+                    if (not accs) and last_acc and len(dates) >= 2 and current_name and ((" IDR " in f" {line} ") or (" USD " in f" {line} ")):
+                        toks = line.split()
+                        currency_idx = None
+                        for j, t in enumerate(toks):
+                            if t in ("IDR","CNY", "USD"):
+                                currency_idx = j
+                                break
+                        if currency_idx is None:
+                            continue
+
+                        fasilitas = " ".join(toks[:currency_idx]).strip().upper()
+                        plafond = _parse_amount(toks[currency_idx + 1]) if currency_idx + 1 < len(toks) else None
+
+                        try:
+                            dt_akhir = datetime.strptime(dates[-1], "%d-%m-%Y").date()
+                        except Exception:
+                            dt_akhir = None
+
+                        nama_full = f"{current_name} ({current_cif})" if current_cif else current_name
+
+                        rows.append({
+                            "Nama": nama_full,
+                            "ACC No": last_acc,
+                            "Cabang": cabang_code,
+                            "Fasilitas": fasilitas,
+                            "Plafond": plafond,
+                            "Tgl PMK/PK Akhir": dt_akhir,
+                            "SumberFile": pdf_path.name,
+                        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Fasilitas"] = df["Fasilitas"].astype(str).str.upper().str.replace(r"\s+", " ", regex=True)
+    return df
+
+
+
